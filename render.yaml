@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: amazon-ebay-research-autopost
+    name: amazon-ebay-reliable-scan
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -8,7 +8,3 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: EBAY_MARKETPLACE_ID
-        value: EBAY_GB
-      - key: EBAY_DEFAULT_CATEGORY_ID
-        value: "179175"

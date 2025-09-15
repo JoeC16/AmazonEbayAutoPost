@@ -1,12 +1,11 @@
-
 """
-arbitrage_core.py (v3)
-- Scrape Amazon UK Best Sellers (or auto-discover categories)
-- Check eBay UK price AND verify demand by parsing "sold" counts from completed/sold listings
-- Return ranked "suggestions to list" based on profit + demand thresholds
+arbitrage_core.py (v4)
+- Amazon: robust GET with optional proxy providers (SCRAPERAPI_KEY or ZENROWS_API_KEY).
+- eBay: demand & best-price prefer official Finding API if EBAY_APP_ID is set; else HTML fallback.
+- Goal: make scans *work reliably* on Render without crashing.
 """
-import random, re, time, urllib.parse, os
-from typing import List, Optional, Tuple, Set, Dict, Any
+import os, random, re, time, urllib.parse
+from typing import List, Optional, Tuple, Set
 from dataclasses import dataclass
 
 import requests
@@ -22,17 +21,65 @@ HEADERS_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
 ]
 
-def sleep_polite(a=0.8, b=1.8):
+DELAY_MIN = float(os.environ.get("SCRAPER_DELAY_MIN", 0.9))
+DELAY_MAX = float(os.environ.get("SCRAPER_DELAY_MAX", 2.0))
+MAX_RETRIES = int(os.environ.get("SCRAPER_MAX_RETRIES", 6))
+BACKOFF_BASE = float(os.environ.get("SCRAPER_BACKOFF_BASE", 2.0))
+
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
+
+def sleep_polite(a: float = DELAY_MIN, b: float = DELAY_MAX):
     time.sleep(random.uniform(a, b))
 
+class FetchError(Exception):
+    pass
+
+def _wrap_with_provider(url: str) -> str:
+    """Use a proxy/antibot provider when available (preferred on Render)."""
+    if SCRAPERAPI_KEY:
+        # country_code=uk to localize prices/listings; keep_headers for UA propagation
+        wrapper = "http://api.scraperapi.com"
+        params = {"api_key": SCRAPERAPI_KEY, "country_code": "uk", "keep_headers": "true", "url": url}
+        return wrapper + "?" + urllib.parse.urlencode(params)
+    if ZENROWS_API_KEY:
+        wrapper = "https://api.zenrows.com/v1/"
+        params = {"apikey": ZENROWS_API_KEY, "url": url, "premium_proxy": "true", "js_render": "false"}
+        return wrapper + "?" + urllib.parse.urlencode(params)
+    return url
+
 def get(url: str) -> requests.Response:
-    headers = {"User-Agent": random.choice(HEADERS_POOL), "Accept-Language": "en-GB,en;q=0.9"}
-    resp = requests.get(url, headers=headers, timeout=25)
-    if resp.status_code in (429, 503):
-        time.sleep(3.0)
-        resp = requests.get(url, headers=headers, timeout=25)
-    resp.raise_for_status()
-    return resp
+    """
+    Robust GET with rotating headers, retry/backoff and optional proxy providers.
+    Raises FetchError if all retries fail.
+    """
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        headers = {
+            "User-Agent": random.choice(HEADERS_POOL),
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Upgrade-Insecure-Requests": "1",
+            "DNT": "1",
+        }
+        try:
+            url_eff = _wrap_with_provider(url)
+            resp = requests.get(url_eff, headers=headers, timeout=30)
+            # If using provider, many errors are handled upstream; still handle 403/429/5xx
+            if resp.status_code in (429, 503, 502, 520, 522, 524):
+                time.sleep(BACKOFF_BASE * attempt);  continue
+            if resp.status_code == 403:
+                time.sleep(BACKOFF_BASE * attempt)
+                if attempt < MAX_RETRIES:
+                    continue
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            last_exc = e
+            time.sleep(BACKOFF_BASE * attempt)
+    raise FetchError(f"Failed to fetch after retries: {url} :: {last_exc}")
 
 _price_re = re.compile(r"£\s*([0-9]+(?:[\.,][0-9]{1,2})?)")
 def parse_price_gbp(text: str) -> Optional[float]:
@@ -128,7 +175,7 @@ def discover_best_seller_categories(max_categories: int = 20) -> List[str]:
                     break
         if not found:
             found.update(DEFAULT_SEED_CATEGORIES[:max_categories])
-    except Exception:
+    except FetchError:
         found.update(DEFAULT_SEED_CATEGORIES[:max_categories])
     return sorted(found)[:max_categories]
 
@@ -196,7 +243,7 @@ def scrape_amazon_bestsellers(category_url: str, max_items: int = 50) -> List[Am
     for pg in [1, 2, 3]:
         url = category_url + ("&" if "?" in category_url else "?") + f"pg={pg}"
         sleep_polite()
-        resp = get(url)
+        resp = get(url)  # now uses proxy + retries
         soup = BeautifulSoup(resp.text, "html.parser")
         cards = soup.select("div.zg-grid-general-faceout, div._cDEzb_grid-cell_1uMOS")
         if not cards:
@@ -209,60 +256,109 @@ def scrape_amazon_bestsellers(category_url: str, max_items: int = 50) -> List[Am
                     return out
     return out
 
-@dataclass
-class EbayResult:
-    title: str
-    price_gbp: Optional[float]
-    shipping_gbp: float
-    url: str
-
-def scrape_ebay_best_price(query: str, max_results: int = 8) -> Optional[EbayResult]:
+# ---------- eBay via official API (preferred) ----------
+def ebay_find_best_price_api(app_id: str, query: str) -> Optional[EbayResult]:
+    """
+    Uses eBay Finding API 'findItemsByKeywords' with filters:
+    - BuyItNowOnly
+    - Condition: New
+    - Sort: PricePlusShippingLowest
+    """
+    endpoint = "https://svcs.ebay.com/services/search/FindingService/v1"
     params = {
-        "_nkw": query,
-        "LH_BIN": "1",
-        "LH_PrefLoc": "1",
-        "LH_ItemCondition": "1000",
-        "rt": "nc",
-        "_sop": "15",
+        "OPERATION-NAME": "findItemsByKeywords",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": app_id,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "true",
+        "keywords": query,
+        "buyerPostalCode": "SW1A1AA",  # London centre; improve with user location if desired
+        "sortOrder": "PricePlusShippingLowest",
+        "itemFilter(0).name": "ListingType",
+        "itemFilter(0).value(0)": "FixedPrice",
+        "itemFilter(1).name": "Condition",
+        "itemFilter(1).value(0)": "1000",  # New
+        "itemFilter(2).name": "LocatedIn",
+        "itemFilter(2).value(0)": "GB",
+        "paginationInput.entriesPerPage": "10",
     }
+    resp = requests.get(endpoint, params=params, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        items = data["findItemsByKeywordsResponse"][0]["searchResult"][0].get("item", [])
+        if not items:
+            return None
+        # pick cheapest total (price + shipping)
+        best = None
+        for it in items:
+            selling = it.get("sellingStatus", [{}])[0]
+            price = float(selling.get("currentPrice", [{}])[0].get("__value__", "0"))
+            ship_raw = it.get("shippingInfo", [{}])[0].get("shippingServiceCost", [{}])
+            ship_cost = float(ship_raw[0].get("__value__", "0")) if ship_raw else 0.0
+            total = price + ship_cost
+            if best is None or total < best[0]:
+                best = (total, price, ship_cost, it.get("viewItemURL", [""])[0], it.get("title", [""])[0])
+        if not best:
+            return None
+        total, price, ship_cost, url, title = best
+        return EbayResult(title=title[:200], price_gbp=price, shipping_gbp=ship_cost, url=url)
+    except Exception:
+        return None
+
+def ebay_completed_sold_count_api(app_id: str, query: str, entries: int = 50) -> int:
+    """
+    Uses eBay Finding API 'findCompletedItems' + SoldItemsOnly=true to count recent solds.
+    """
+    endpoint = "https://svcs.ebay.com/services/search/FindingService/v1"
+    params = {
+        "OPERATION-NAME": "findCompletedItems",
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": app_id,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "REST-PAYLOAD": "true",
+        "keywords": query,
+        "itemFilter(0).name": "SoldItemsOnly",
+        "itemFilter(0).value(0)": "true",
+        "itemFilter(1).name": "LocatedIn",
+        "itemFilter(1).value(0)": "GB",
+        "paginationInput.entriesPerPage": str(entries),
+        "sortOrder": "EndTimeSoonest"
+    }
+    resp = requests.get(endpoint, params=params, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("findCompletedItemsResponse", [{}])[0].get("searchResult", [{}])[0].get("item", [])
+    # Count items that ended with sales (eBay finding doesn't always provide quantity, but presence counts as sold)
+    return len(items)
+
+# ---------- eBay HTML fallback ----------
+def scrape_ebay_best_price(query: str, max_results: int = 8) -> Optional[EbayResult]:
+    params = {"_nkw": query, "LH_BIN": "1", "LH_PrefLoc": "1", "LH_ItemCondition": "1000", "rt": "nc", "_sop": "15"}
     url = EBAY_SEARCH_URL + "?" + urllib.parse.urlencode(params)
     sleep_polite()
     resp = get(url)
     soup = BeautifulSoup(resp.text, "html.parser")
-
     items = soup.select("li.s-item")[:max_results]
     best: Optional[EbayResult] = None
-
     for it in items:
         title_el = it.select_one("div.s-item__title span[role='heading'], h3.s-item__title")
         title = title_el.get_text(" ", strip=True) if title_el else ""
-
         price_el = it.select_one("span.s-item__price")
         price = parse_price_gbp(price_el.get_text(strip=True) if price_el else "")
-
         ship_el = it.select_one("span.s-item__shipping, span.s-item__logisticsCost")
         shipping = parse_price_gbp(ship_el.get_text(strip=True) if ship_el else "") or 0.0
-
         link_el = it.select_one("a.s-item__link")
         link = link_el.get("href") if link_el else url
-
         if price is None:
             continue
-
         total = price + shipping
         if best is None or total < (best.price_gbp or 9e9) + (best.shipping_gbp or 0):
             best = EbayResult(title=title[:200], price_gbp=price, shipping_gbp=shipping, url=link)
-
     return best
 
-def ebay_sold_count(query: str, max_scan: int = 20) -> int:
-    params = {
-        "_nkw": query,
-        "LH_Sold": "1",
-        "LH_Complete": "1",
-        "rt": "nc",
-        "_sop": "10"
-    }
+def ebay_sold_count_html(query: str, max_scan: int = 20) -> int:
+    params = {"_nkw": query, "LH_Sold": "1", "LH_Complete": "1", "rt": "nc", "_sop": "10"}
     url = EBAY_SEARCH_URL + "?" + urllib.parse.urlencode(params)
     sleep_polite(0.6, 1.4)
     resp = get(url)
@@ -307,20 +403,30 @@ def find_opportunities(categories: List[str],
     if avoid_keywords is None:
         avoid_keywords = ["Apple iPhone","Nike","PlayStation","Xbox","Gift Card"]
     rows: List[OpportunityRow] = []
+    EBAY_APP_ID = os.environ.get("EBAY_APP_ID")  # Finding API key
     for cat in categories:
         products = scrape_amazon_bestsellers(cat, max_items=max_items)
         for p in products:
             if any(k.lower() in p.title.lower() for k in avoid_keywords):
                 continue
             query = " ".join(p.title.split()[:query_words])
-            best = scrape_ebay_best_price(query, max_results=max_ebay_results)
+            # eBay best price
+            if EBAY_APP_ID:
+                best = ebay_find_best_price_api(EBAY_APP_ID, query)
+            else:
+                best = scrape_ebay_best_price(query, max_results=max_ebay_results)
             ebay_price = best.price_gbp if best else None
             ebay_ship = best.shipping_gbp if best else 0.0
+            # eBay demand
+            sold_recent = 0
+            if EBAY_APP_ID:
+                sold_recent = ebay_completed_sold_count_api(EBAY_APP_ID, query, entries=50)
+            else:
+                sold_recent = ebay_sold_count_html(query, max_scan=20)
             ebay_total, fees, profit = estimate_profit(p.price_gbp, ebay_price, ebay_ship, ebay_fee_rate, ebay_fixed_fee)
             margin = (profit / ebay_total) if (profit is not None and ebay_total) else None
-            sold_recent = ebay_sold_count(query, max_scan=20)
-            if (profit is not None and margin is not None and sold_recent is not None
-                and profit >= min_profit and margin >= min_margin and sold_recent >= min_sold_recent):
+            if (profit is not None and margin is not None
+                and sold_recent >= min_sold_recent and profit >= min_profit and margin >= min_margin):
                 rows.append(OpportunityRow(
                     title=p.title,
                     amazon_price=p.price_gbp,
